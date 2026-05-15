@@ -8,17 +8,29 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.model import P2MSAndesNet
 
 class FederatedOrchestrator:
-    def __init__(self, data_path="data/processed", rounds=50, local_epochs=5, lr=0.001):
+    def __init__(self, data_path="data/processed", rounds=50, local_epochs=5, lr=0.001, 
+                 dp_sigma=0.1, dp_clip_norm=1.0):
         self.data_path = data_path
         self.rounds = rounds
         self.local_epochs = local_epochs
         self.lr = lr
+        
+        # Privacy Parameters
+        self.dp_sigma = dp_sigma
+        self.dp_clip_norm = dp_clip_norm
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Load all nodes from the processed data directory
-        self.nodes = {}
-        for file in os.listdir(data_path):
-            if file.endswith(".npz"):
+        # Debug: Check if directory exists
+        if not os.path.exists(data_path):
+            print(f"[DEBUG] ERROR: Directory not found: {os.path.abspath(data_path)}")
+            self.nodes = {}
+        else:
+            self.nodes = {}
+            files = [f for f in os.listdir(data_path) if f.endswith(".npz")]
+            print(f"[DEBUG] Found {len(files)} data files in {data_path}")
+            
+            for file in files:
                 name = file.replace(".npz", "")
                 data = np.load(os.path.join(data_path, file))
                 X = torch.tensor(data['features'], dtype=torch.float32)
@@ -32,13 +44,13 @@ class FederatedOrchestrator:
                 }
         
         if not self.nodes:
-            raise FileNotFoundError(f"No .npz files found in {data_path}. Run Phase I first.")
-            
+            print("[DEBUG] CRITICAL: No nodes loaded. Federation cannot start.")
+            return
+
         self.total_samples = sum(node['n_k'] for node in self.nodes.values())
         self.global_model = P2MSAndesNet().to(self.device)
 
     def train_local(self, node_loader):
-        """Standard local training step on a node."""
         local_model = copy.deepcopy(self.global_model)
         local_model.train()
         optimizer = optim.Adam(local_model.parameters(), lr=self.lr)
@@ -52,70 +64,65 @@ class FederatedOrchestrator:
                 loss = criterion(outputs, batch_y)
                 loss.backward()
                 optimizer.step()
-        
         return local_model.state_dict()
 
     def aggregate(self, local_weights_list):
-        """
-        FedAvg: Weighted average of local model parameters.
-        Includes dtype restoration for BatchNorm counters (Long tensors).
-        """
-        # Start with a deep copy of the first node's weights to get the model structure
+        """FedAvg with Differential Privacy (Clipping + Noise)."""
         avg_weights = copy.deepcopy(local_weights_list[0][0])
         
         for key in avg_weights.keys():
-            # 1. Initialize an accumulator as Float to allow precise weighted multiplication
             avg_weights[key] = torch.zeros_like(avg_weights[key], dtype=torch.float32)
             
-            # 2. Sum the weighted contributions from every node
             for weights, n_k in local_weights_list:
+                param_update = weights[key].float()
+                # --- DP Step 1: Clipping ---
+                l2_norm = torch.norm(param_update)
+                clip_factor = min(1.0, self.dp_clip_norm / (l2_norm.item() + 1e-6))
+                
                 weight_factor = n_k / self.total_samples
-                avg_weights[key] += weights[key].float() * weight_factor
+                avg_weights[key] += (param_update * clip_factor) * weight_factor
             
-            # 3. Type Restoration: Cast back to original dtype (e.g., Long for batch counters)
-            # This prevents the 'Float can't be cast to Long' RuntimeError
+            # --- DP Step 2: Adding Gaussian Noise ---
+            if "weight" in key or "bias" in key:
+                noise = torch.randn_like(avg_weights[key]) * (self.dp_sigma * self.dp_clip_norm)
+                avg_weights[key] += noise
+
+            # Restore original dtypes
             original_dtype = local_weights_list[0][0][key].dtype
             if original_dtype == torch.long:
                 avg_weights[key] = torch.round(avg_weights[key]).to(torch.long)
             else:
                 avg_weights[key] = avg_weights[key].to(original_dtype)
-                
         return avg_weights
 
     def run_federation(self):
+        if not hasattr(self, 'nodes') or not self.nodes:
+            print("[DEBUG] Federation aborted: No nodes.")
+            return
+
         print("="*70)
-        print(f"P²MS-Andes Federated Training | {len(self.nodes)} Nodes | Device: {self.device}")
+        print(f"P²MS-Andes DP-Federated Training | {len(self.nodes)} Nodes")
+        print(f"Privacy: Sigma={self.dp_sigma}, Clip={self.dp_clip_norm}")
         print("="*70)
-        history = []
 
         for r in range(self.rounds):
             local_updates = []
-            
-            # Local Training Phase
             for name, node in self.nodes.items():
                 w_local = self.train_local(node['loader'])
                 local_updates.append((w_local, node['n_k']))
             
-            # Aggregation Phase (Global weight update)
             new_global_weights = self.aggregate(local_updates)
             self.global_model.load_state_dict(new_global_weights)
 
-            # Global Evaluation Phase
             val_loss = self.evaluate_global()
-            history.append(val_loss)
-            
             if r % 5 == 0 or r == self.rounds - 1:
-                print(f"Round {r:02d}/{self.rounds} | Global Aggregated Loss: {val_loss:.4f}")
+                print(f"Round {r:02d}/{self.rounds} | Privacy-Hardened Loss: {val_loss:.4f}")
         
-        # Save the global checkpoint for Phase III (XAI)
-        save_path = "data/processed/global_model.pth"
-        torch.save(self.global_model.state_dict(), save_path)
+        torch.save(self.global_model.state_dict(), "data/processed/global_model.pth")
         print("="*70)
-        print(f"Training Complete. Global model saved to: {save_path}")
-        print("="*70)
+        print("Training Complete. Privacy-Hardened Global model saved.")
 
     def evaluate_global(self):
-        """Weighted global loss across all decentralized nodes."""
         self.global_model.eval()
         total_loss = 0
         criterion = nn.CrossEntropyLoss()
