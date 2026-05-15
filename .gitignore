@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments & OS files
+.venv/
+venv/
+ENV/
+.env
+.DS_Store
+Thumbs.db
+
+# Data & Large Artifact Storage (Never commit local datasets)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.npz
+*.pkl
+*.csv
+*.fasta
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
